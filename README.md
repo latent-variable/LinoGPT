@@ -1,0 +1,312 @@
+# LinoGPT
+
+**OpenWebUI + LM Studio + MCP Integration**
+
+A production-ready Docker setup that connects OpenWebUI to LM Studio with full Model Context Protocol (MCP) support. Run powerful local LLMs with web search, HuggingFace, and other tool-calling capabilities through a familiar ChatGPT-like interface.
+
+![Architecture](https://img.shields.io/badge/OpenWebUI-blue) ![LM Studio](https://img.shields.io/badge/LM%20Studio-green) ![MCP](https://img.shields.io/badge/MCP-orange) ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
+
+## ✨ Features
+
+- 🚀 **Zero Configuration MCP**: Auto-discovers MCP servers from LM Studio's `mcp.json`
+- 🔍 **Web Search**: Integrated Tavily search with smart query formulation
+- 🤗 **HuggingFace Integration**: Access HF models and datasets through MCP
+- 💭 **Thinking Tokens**: Displays o1-style reasoning process
+- ⚡ **Streaming Responses**: Real-time streaming with tool execution indicators
+- 🐳 **Docker-based**: Easy deployment with docker-compose
+- 🎨 **Customizable**: Full branding support (custom logo, name, etc.)
+
+## 📋 Prerequisites
+
+- **Docker** and **Docker Compose** installed
+- **LM Studio** v0.3.17 or later (with MCP support)
+- At least 16GB RAM (recommended for running large models)
+- ~50GB disk space for models and Docker volumes
+
+## 🏗️ Architecture
+
+```
+┌─────────────────┐
+│   OpenWebUI     │  Port 3000 - Web Interface
+│  (Docker)       │
+└────────┬────────┘
+         │ OpenAI API format
+         ↓
+┌─────────────────┐
+│  LM Studio      │  Port 5003 - Translation Proxy
+│  Proxy          │
+│  (Docker)       │  • Reads LM Studio's mcp.json
+└────────┬────────┘  • Converts OpenAI → LM Studio format
+         │ /v1/responses  • Handles streaming & tool calls
+         ↓
+┌─────────────────┐
+│   LM Studio     │  Port 5002 - Local LLM Server
+│  (Host Machine) │
+└────────┬────────┘  • Runs local models (Llama, Mistral, etc.)
+         │ Remote MCP  • Executes tool calls via MCP
+         ↓
+┌─────────────────┐
+│  MCP Servers    │  HTTP/HTTPS - Tool Providers
+│  (URLs)         │
+└─────────────────┘  • Tavily (web search)
+                     • HuggingFace (ML tools)
+                     • Custom MCP servers
+```
+
+## 🚀 Quick Start
+
+### 1. Install and Configure LM Studio
+
+1. Download [LM Studio](https://lmstudio.ai/) (v0.3.17+)
+2. Load a model (recommended: `gpt-oss-120b` or similar tool-calling capable model)
+3. **Enable Remote MCP**:
+   - Go to **Settings → Developer**
+   - Enable **"Allow MCP → Remote"**
+4. Start the local server (port 5002)
+
+### 2. Configure MCP Servers in LM Studio
+
+Edit `~/.lmstudio/mcp.json` (macOS/Linux) or `%USERPROFILE%\.lmstudio\mcp.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "tavily": {
+      "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=YOUR_TAVILY_API_KEY"
+    },
+    "hf-mcp-server": {
+      "url": "https://huggingface.co/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_HF_TOKEN"
+      }
+    }
+  }
+}
+```
+
+**Important:** Only **URL-based MCP servers** work with Remote MCP. Command-based servers (Docker) are not supported.
+
+#### Get API Keys:
+- **Tavily**: [Sign up at tavily.com](https://tavily.com/)
+- **HuggingFace**: [Create token at huggingface.co](https://huggingface.co/settings/tokens)
+
+### 3. Test MCP Servers in LM Studio
+
+Before running the proxy, verify your MCP servers work:
+
+1. In LM Studio, start a chat
+2. Ask: *"Search for the latest AI news"*
+3. Confirm you see tool execution (should show "Searching...")
+
+If tools don't work, check:
+- Remote MCP is enabled in settings
+- API keys are correct in `mcp.json`
+- LM Studio server is running
+
+### 4. Clone and Configure LinoGPT
+
+```bash
+git clone https://github.com/latent-variable/LinoGPT.git
+cd LinoGPT
+```
+
+**Update docker-compose.yml:**
+
+Find your host machine's IP address:
+```bash
+# macOS/Linux
+ifconfig | grep "inet " | grep -v 127.0.0.1
+
+# Windows
+ipconfig
+```
+
+Update `LM_STUDIO_BASE` in `lm-studio-proxy.py` line 22:
+```python
+LM_STUDIO_BASE = "http://YOUR_HOST_IP:5002"  # e.g., http://192.168.1.100:5002
+```
+
+Update the mcp.json mount path in `docker-compose.yml` line 57:
+```yaml
+volumes:
+  - /YOUR/PATH/TO/.lmstudio/mcp.json:/app/mcp.json:ro
+```
+
+### 5. Start LinoGPT
+
+```bash
+docker-compose up -d
+```
+
+### 6. Access the Interface
+
+Open your browser: **http://localhost:3000**
+
+- First user to sign up becomes the admin
+- Subsequent users can sign up (configurable)
+
+## 🎨 Customization
+
+### Branding
+
+Update `docker-compose.yml` environment variables:
+
+```yaml
+environment:
+  - WEBUI_NAME=YourAppName
+  - RESPONSE_WATERMARK=Generated by YourApp
+```
+
+### Custom Logo
+
+Replace `linogpt-meme.jpeg` and `favicon/` directory with your own images, then rebuild:
+
+```bash
+docker-compose up -d --build open-webui
+```
+
+### System Prompt
+
+Configure in OpenWebUI:
+1. Go to **Settings → Documents → System Prompt**
+2. Add your custom prompt
+
+## 🔧 Management Commands
+
+```bash
+# View logs
+docker-compose logs -f
+
+# View specific service logs
+docker-compose logs -f lm-studio-proxy
+docker-compose logs -f open-webui
+
+# Restart services
+docker-compose restart
+
+# Rebuild after code changes
+docker-compose up -d --build
+
+# Stop all services
+docker-compose down
+
+# Stop and remove all data (fresh start)
+docker-compose down -v
+```
+
+## 📚 Adding More MCP Servers
+
+1. Edit `~/.lmstudio/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "tavily": { ... },
+    "your-new-server": {
+      "url": "https://your-mcp-server.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
+
+2. Restart the proxy:
+
+```bash
+docker-compose restart lm-studio-proxy
+```
+
+3. Verify it loaded:
+
+```bash
+docker-compose logs lm-studio-proxy | grep "Loaded MCP server"
+```
+
+## 🐛 Troubleshooting
+
+### MCP Tools Not Working
+
+**Check LM Studio Settings:**
+```bash
+# Verify Remote MCP is enabled
+# Settings → Developer → Allow MCP → Remote ✓
+```
+
+**Check mcp.json is mounted:**
+```bash
+docker exec lm-studio-proxy cat /app/mcp.json
+```
+
+**Check proxy logs:**
+```bash
+docker-compose logs lm-studio-proxy | grep -i "mcp"
+```
+
+### OpenWebUI Can't Connect to Proxy
+
+**Verify containers are running:**
+```bash
+docker-compose ps
+```
+
+**Test proxy health:**
+```bash
+curl http://localhost:5003/health
+```
+
+### Streaming Responses Stop Mid-Response
+
+**Check timeout settings in `lm-studio-proxy.py` line 238:**
+```python
+timeout=(10, 300)  # Increase if tool execution takes longer
+```
+
+### "Response ended prematurely" Errors
+
+Usually caused by MCP server timeouts. Check:
+1. MCP server is accessible (try in LM Studio directly)
+2. API keys are valid
+3. Network connectivity
+
+## 🔐 Security Notes
+
+- API keys in `mcp.json` should be kept secure
+- For production, consider:
+  - Enabling authentication (`WEBUI_AUTH=true`)
+  - Using secrets management for API keys
+  - Setting up HTTPS with a reverse proxy
+- The proxy mounts `mcp.json` as read-only
+
+## 📖 Additional Documentation
+
+- [LM Studio MCP Documentation](https://lmstudio.ai/docs/app/plugins/mcp)
+- [OpenWebUI Documentation](https://docs.openwebui.com/)
+- [Model Context Protocol](https://modelcontextprotocol.io/)
+
+## 🤝 Contributing
+
+Contributions welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
+
+## 📝 License
+
+MIT License - See [LICENSE](LICENSE) file for details
+
+## 🙏 Credits
+
+- **LM Studio** - Local LLM inference with MCP support
+- **OpenWebUI** - Beautiful ChatGPT-like interface
+- **Anthropic** - Model Context Protocol specification
+- **Tavily** - AI-optimized web search API
+
+---
+
+**Made with ❤️ by [Lino Valdovinos](https://github.com/latent-variable)**
+
+*If you find this useful, please ⭐ the repository!*

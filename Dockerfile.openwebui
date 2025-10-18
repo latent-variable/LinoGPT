@@ -1,0 +1,17 @@
+FROM ghcr.io/open-webui/open-webui:main
+
+# Copy LinoGPT custom favicon package
+# This includes all favicon sizes and formats for proper display across devices
+COPY favicon/favicon.ico /app/build/static/favicon.ico
+COPY favicon/favicon.svg /app/build/static/favicon.svg
+COPY favicon/favicon-96x96.png /app/build/static/favicon-96x96.png
+COPY favicon/apple-touch-icon.png /app/build/static/apple-touch-icon.png
+COPY favicon/web-app-manifest-192x192.png /app/build/static/web-app-manifest-192x192.png
+COPY favicon/web-app-manifest-512x512.png /app/build/static/web-app-manifest-512x512.png
+COPY favicon/site.webmanifest /app/build/static/site.webmanifest
+
+# Copy meme image as favicon.png for OpenWebUI internal logo display
+COPY linogpt-meme.jpeg /app/build/static/favicon.png
+
+# Note: The WEBUI_NAME environment variable will change the displayed name to "LinoGPT"
+# This Dockerfile customizes the favicon/logo to match the LinoGPT branding
