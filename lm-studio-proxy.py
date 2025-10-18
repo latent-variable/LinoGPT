@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 import logging
 from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
+from typing import Any, Optional
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -290,12 +291,90 @@ def stream_lm_studio_response(lm_studio_request):
 
         current_event = None
         reasoning_ready = False
-        active_tool_messages: set[str] = set()
-        search_banner_displayed = False
         completed_output_sent = False
         streamed_output_ids: set[str] = set()
         function_calls: dict[str, dict] = {}
         tool_call_order: list[str] = []
+        mcp_call_info: dict[str, dict] = {}
+
+        def escape_markdown(text: Any, *, for_code: bool = False) -> str:
+            if not isinstance(text, str):
+                text = str(text)
+            sanitized = text.replace("\n", " ").strip()
+            if for_code:
+                return sanitized.replace("`", r"\`")
+            return sanitized.replace("*", r"\*")
+
+        def format_argument_value(value: Any) -> str:
+            if isinstance(value, (int, float, bool)):
+                return str(value)
+            if isinstance(value, str):
+                clean_value = value.replace("\n", " ").strip()
+                return clean_value if len(clean_value) <= 60 else f"{clean_value[:57]}..."
+            try:
+                serialized = json.dumps(value)
+            except (TypeError, ValueError):
+                serialized = str(value)
+            return serialized if len(serialized) <= 60 else f"{serialized[:57]}..."
+
+        def maybe_emit_mcp_message(item_id: str, allow_partial: bool = False) -> Optional[str]:
+            info = mcp_call_info.get(item_id)
+            if not info or info.get("displayed"):
+                return None
+
+            tool_name = info.get("name") or info.get("tool_name") or info.get("label") or info.get("server_label") or "unknown_tool"
+            arguments_json = info.get("arguments_json")
+            arguments_text = info.get("arguments_text")
+            arguments_buffer = info.get("arguments_buffer", [])
+
+            query = None
+            args_preview = None
+
+            if isinstance(arguments_json, dict):
+                for candidate_key in ("query", "search_query", "q"):
+                    if candidate_key in arguments_json and arguments_json[candidate_key]:
+                        query = arguments_json[candidate_key]
+                        break
+                if not query and arguments_json:
+                    preview_items: list[str] = []
+                    for key, value in list(arguments_json.items())[:3]:
+                        preview_items.append(f"{key}={format_argument_value(value)}")
+                    if preview_items:
+                        args_preview = ", ".join(preview_items)
+            elif arguments_text:
+                trimmed_text = arguments_text.strip()
+                if trimmed_text:
+                    args_preview = trimmed_text if len(trimmed_text) <= 80 else f"{trimmed_text[:77]}..."
+            elif allow_partial and arguments_buffer:
+                buffer_text = "".join(arguments_buffer).strip()
+                if buffer_text:
+                    args_preview = buffer_text if len(buffer_text) <= 80 else f"{buffer_text[:77]}..."
+
+            if not allow_partial and arguments_json is None and not arguments_text:
+                return None
+
+            message_lines = [f"\n\n🔧 **Tool Call: `{escape_markdown(tool_name, for_code=True)}`**"]
+            if query:
+                message_lines.append(f"📝 Query: *{escape_markdown(query)}*")
+            elif args_preview:
+                message_lines.append(f"📝 Arguments: *{escape_markdown(args_preview)}*")
+            message_lines.append("\n")
+            tool_message = "\n".join(message_lines)
+
+            info["displayed"] = True
+            logger.info(f"Displaying tool call: {tool_name}")
+            search_indicator = {
+                "id": response_id or "chatcmpl-proxy",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": tool_message},
+                    "finish_reason": None
+                }]
+            }
+            return f"data: {json.dumps(search_indicator)}\n\n"
         final_chunk_sent = False
         final_finish_reason = "stop"
 
@@ -381,28 +460,33 @@ def stream_lm_studio_response(lm_studio_request):
                     elif current_event in ("response.reasoning_text.done", "response.content_part.done"):
                         reasoning_ready = True
 
-                    # Detect MCP tool calls and show search indicator
+                    # Extra diagnostics for MCP events to understand available fields
+                    if current_event and current_event.startswith("response.mcp_call") and not current_event.endswith(".delta"):
+                        logger.debug(f"MCP event payload ({current_event}): {chunk_data}")
+                    if current_event == "response.output_item.added":
+                        item_debug = chunk_data.get("item", {})
+                        if item_debug.get("type") == "mcp_call":
+                            logger.debug(f"Output item event payload ({current_event}): {item_debug}")
+
+                    # Detect MCP tool calls and show detailed tool execution indicator
                     if current_event == "response.mcp_call.in_progress":
                         item_id = chunk_data.get("item_id")
-                        if item_id and item_id in active_tool_messages:
-                            pass
-                        elif not search_banner_displayed:
-                            tool_name = chunk_data.get("name") or chunk_data.get("tool_name") or chunk_data.get("label") or "tool"
-                            if item_id:
-                                active_tool_messages.add(item_id)
-                            search_indicator = {
-                                "id": response_id or "chatcmpl-proxy",
-                                "object": "chat.completion.chunk",
-                                "created": 0,
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": f"\n\n🔍 *Searching with {tool_name}...*\n\n"},
-                                    "finish_reason": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(search_indicator)}\n\n"
-                            search_banner_displayed = True
+                        if item_id:
+                            info = mcp_call_info.setdefault(
+                                item_id,
+                                {
+                                    "name": None,
+                                    "server_label": None,
+                                    "arguments_buffer": [],
+                                    "arguments_text": "",
+                                    "arguments_json": None,
+                                    "displayed": False,
+                                },
+                            )
+                            for key in ("name", "tool_name", "label"):
+                                if key in chunk_data and chunk_data[key]:
+                                    info["name"] = chunk_data[key]
+                                    break
 
                     if current_event == "response.output_item.added":
                         item = chunk_data.get("item", {})
@@ -444,6 +528,24 @@ def stream_lm_studio_response(lm_studio_request):
                                     ],
                                 }
                                 yield f"data: {json.dumps(tool_chunk)}\n\n"
+                        elif item.get("type") == "mcp_call":
+                            item_id = item.get("id")
+                            if item_id:
+                                info = mcp_call_info.setdefault(
+                                    item_id,
+                                    {
+                                        "name": None,
+                                        "server_label": None,
+                                        "arguments_buffer": [],
+                                        "arguments_text": "",
+                                        "arguments_json": None,
+                                        "displayed": False,
+                                    },
+                                )
+                                if item.get("name"):
+                                    info["name"] = item["name"]
+                                if item.get("server_label"):
+                                    info["server_label"] = item["server_label"]
 
                     if current_event == "response.function_call_arguments.delta":
                         item_id = chunk_data.get("item_id")
@@ -485,6 +587,62 @@ def stream_lm_studio_response(lm_studio_request):
                         arguments = chunk_data.get("arguments", "")
                         if item_id and item_id in function_calls:
                             function_calls[item_id]["arguments"] = arguments or function_calls[item_id]["arguments"]
+
+                    if current_event == "response.mcp_call_arguments.delta":
+                        item_id = chunk_data.get("item_id")
+                        delta = chunk_data.get("delta", "")
+                        if item_id and delta:
+                            info = mcp_call_info.setdefault(
+                                item_id,
+                                {
+                                    "name": None,
+                                    "server_label": None,
+                                    "arguments_buffer": [],
+                                    "arguments_text": "",
+                                    "arguments_json": None,
+                                    "displayed": False,
+                                },
+                            )
+                            info.setdefault("arguments_buffer", []).append(delta)
+
+                    if current_event == "response.mcp_call_arguments.done":
+                        item_id = chunk_data.get("item_id")
+                        arguments = chunk_data.get("arguments", "")
+                        if item_id:
+                            info = mcp_call_info.setdefault(
+                                item_id,
+                                {
+                                    "name": None,
+                                    "server_label": None,
+                                    "arguments_buffer": [],
+                                    "arguments_text": "",
+                                    "arguments_json": None,
+                                    "displayed": False,
+                                },
+                            )
+                            info["arguments_text"] = arguments or "".join(info.get("arguments_buffer", []))
+                            if arguments:
+                                try:
+                                    info["arguments_json"] = json.loads(arguments)
+                                except json.JSONDecodeError:
+                                    logger.debug(f"Failed to parse MCP arguments JSON for {item_id}: {arguments}")
+                                    info["arguments_json"] = None
+                            chunk = maybe_emit_mcp_message(item_id, allow_partial=False)
+                            if chunk:
+                                reasoning_payload = maybe_send_reasoning()
+                                if reasoning_payload:
+                                    yield reasoning_payload
+                                yield chunk
+
+                    if current_event == "response.mcp_call.completed":
+                        item_id = chunk_data.get("item_id")
+                        if item_id:
+                            chunk = maybe_emit_mcp_message(item_id, allow_partial=True)
+                            if chunk:
+                                reasoning_payload = maybe_send_reasoning()
+                                if reasoning_payload:
+                                    yield reasoning_payload
+                                yield chunk
 
                     # Look for output text delta events (actual content)
                     if current_event == "response.output_text.delta":
