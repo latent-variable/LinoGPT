@@ -288,9 +288,8 @@ def stream_lm_studio_response(lm_studio_request):
         model = lm_studio_request.get("model")
         reasoning_started = False
         reasoning_sent = False
-
+        reasoning_role_sent = False
         current_event = None
-        reasoning_ready = False
         completed_output_sent = False
         streamed_output_ids: set[str] = set()
         function_calls: dict[str, dict] = {}
@@ -379,16 +378,18 @@ def stream_lm_studio_response(lm_studio_request):
         final_finish_reason = "stop"
 
         def maybe_send_reasoning():
-            nonlocal reasoning_sent
-            if reasoning_sent or not reasoning_chunks:
+            nonlocal reasoning_sent, reasoning_role_sent
+            if reasoning_sent:
                 return None
-            thinking_text = "".join(reasoning_chunks)
-            if not thinking_text.strip():
+            if not reasoning_chunks:
+                return None
+            pending_text = "".join(reasoning_chunks).strip()
+            if not pending_text:
                 reasoning_sent = True
                 logger.info("Skipping empty thinking chunk")
                 return None
-            logger.info(f"Sending thinking chunk ({len(reasoning_chunks)} pieces, {len(thinking_text)} chars)")
-            think_chunk = {
+            logger.info("Flushing buffered reasoning that was not streamed live")
+            reasoning_payload = {
                 "id": response_id or "chatcmpl-proxy",
                 "object": "chat.completion.chunk",
                 "created": 0,
@@ -398,15 +399,15 @@ def stream_lm_studio_response(lm_studio_request):
                         "index": 0,
                         "delta": {
                             "role": "assistant",
-                            "reasoning_content": thinking_text,
+                            "reasoning_content": pending_text,
                         },
                         "finish_reason": None,
                     }
                 ],
             }
             reasoning_sent = True
-            logger.info("Reasoning sent flag set to True")
-            return f"data: {json.dumps(think_chunk)}\n\n"
+            reasoning_role_sent = True
+            return f"data: {json.dumps(reasoning_payload)}\n\n"
         for line in response.iter_lines():
             if not line:
                 continue
@@ -457,8 +458,28 @@ def stream_lm_studio_response(lm_studio_request):
                             if not reasoning_started:
                                 logger.info("Started collecting reasoning tokens")
                                 reasoning_started = True
+                            reasoning_delta = {
+                                "id": response_id or "chatcmpl-proxy",
+                                "object": "chat.completion.chunk",
+                                "created": 0,
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "reasoning_content": delta,
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            if not reasoning_role_sent:
+                                reasoning_delta["choices"][0]["delta"]["role"] = "assistant"
+                                reasoning_role_sent = True
+                            reasoning_sent = True
+                            yield f"data: {json.dumps(reasoning_delta)}\n\n"
                     elif current_event in ("response.reasoning_text.done", "response.content_part.done"):
-                        reasoning_ready = True
+                        reasoning_sent = reasoning_sent or bool(reasoning_chunks)
 
                     # Extra diagnostics for MCP events to understand available fields
                     if current_event and current_event.startswith("response.mcp_call") and not current_event.endswith(".delta"):
