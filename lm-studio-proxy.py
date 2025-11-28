@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 # LM Studio endpoint
-LM_STUDIO_BASE = "http://192.168.50.142:5002"
+# Use host.docker.internal to reach the host machine from Docker on macOS
+LM_STUDIO_BASE = "http://host.docker.internal:5002"
 
 # MCP tools configuration
 
@@ -197,11 +198,20 @@ def chat_completions():
         if not last_user_found:
             return jsonify({"error": "No user message found"}), 400
 
+        # Add guidance for tools that generate visual content
+        visual_tools_guidance = (
+            "IMPORTANT: When you use tools that generate images, videos, or other visual content "
+            "(like image generation, screenshot tools, diagram creation, etc.), you MUST include the "
+            "generated content in your response. For images, use markdown image syntax: ![description](url). "
+            "For files, provide clickable links. Always make the result immediately visible to the user. "
+            "Never just acknowledge that you created something without showing it."
+        )
+
         conversation_text = "\n".join(transcript_lines)
         if system_prompt:
-            input_text = f"{system_prompt}\n\n{conversation_text}\nAssistant:"
+            input_text = f"{system_prompt}\n\n{visual_tools_guidance}\n\n{conversation_text}\nAssistant:"
         else:
-            input_text = f"{conversation_text}\nAssistant:"
+            input_text = f"{visual_tools_guidance}\n\n{conversation_text}\nAssistant:"
 
         # Build LM Studio request
         is_streaming = openai_request.get('stream', False)
@@ -214,12 +224,13 @@ def chat_completions():
             "stream": is_streaming,
         }
 
-        # Pass MCP tools to LM Studio
+        # Try with MCP tools enabled - fallback logic will handle failures
+        mcp_disabled = False
         if MCP_TOOLS:
             lm_studio_request["tools"] = MCP_TOOLS
 
         logger.info(f"Sending to LM Studio /v1/responses (streaming={is_streaming})")
-        logger.debug(f"MCP tools being sent: {sanitized_mcp_tools(MCP_TOOLS)}")
+        logger.debug(f"MCP tools being sent: {sanitized_mcp_tools(MCP_TOOLS) if MCP_TOOLS else 'None'}")
 
         if is_streaming:
             # Handle streaming response
@@ -228,7 +239,7 @@ def chat_completions():
                 mimetype='text/event-stream'
             )
         else:
-            # Handle non-streaming response
+            # Handle non-streaming response with MCP fallback
             response = requests.post(
                 f"{LM_STUDIO_BASE}/v1/responses",
                 json=lm_studio_request,
@@ -236,12 +247,26 @@ def chat_completions():
                 timeout=120
             )
 
+            # If request failed with MCP tools, retry without them
+            if response.status_code == 500 and MCP_TOOLS and "tools" in lm_studio_request:
+                logger.warning(f"LM Studio failed with MCP tools (500 error), retrying without MCP...")
+                lm_studio_request_no_mcp = lm_studio_request.copy()
+                del lm_studio_request_no_mcp["tools"]
+
+                response = requests.post(
+                    f"{LM_STUDIO_BASE}/v1/responses",
+                    json=lm_studio_request_no_mcp,
+                    headers={"Content-Type": "application/json"},
+                    timeout=120
+                )
+                mcp_disabled = True
+
             if response.status_code != 200:
                 logger.error(f"LM Studio error: {response.text}")
                 return jsonify({"error": f"LM Studio returned {response.status_code}: {response.text}"}), response.status_code
 
             lm_studio_response = response.json()
-            openai_response = convert_lm_studio_to_openai(lm_studio_response)
+            openai_response = convert_lm_studio_to_openai(lm_studio_response, mcp_disabled=mcp_disabled)
             return jsonify(openai_response)
 
     except requests.Timeout:
@@ -264,6 +289,35 @@ def stream_lm_studio_response(lm_studio_request):
             stream=True,
             timeout=(10, 300)  # (connect timeout, read timeout) - 5 min for tool execution
         )
+
+        # If request failed with MCP tools, retry without them
+        if response.status_code == 500 and "tools" in lm_studio_request:
+            logger.warning(f"LM Studio streaming failed with MCP tools (500 error), retrying without MCP...")
+            lm_studio_request_no_mcp = lm_studio_request.copy()
+            del lm_studio_request_no_mcp["tools"]
+
+            # Send warning to client
+            warning_chunk = {
+                "id": "chatcmpl-proxy",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": lm_studio_request.get("model"),
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "⚠️ **MCP tools disabled** (model/LM Studio compatibility issue)\n\n"},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(warning_chunk)}\n\n"
+
+            # Retry without MCP
+            response = requests.post(
+                f"{LM_STUDIO_BASE}/v1/responses",
+                json=lm_studio_request_no_mcp,
+                headers={"Content-Type": "application/json"},
+                stream=True,
+                timeout=(10, 300)
+            )
 
         if response.status_code != 200:
             error_data = {
@@ -568,6 +622,29 @@ def stream_lm_studio_response(lm_studio_request):
                                 if item.get("server_label"):
                                     info["server_label"] = item["server_label"]
 
+                                # Immediately show tool call indicator to user
+                                tool_name = info.get("name") or item.get("name") or "tool"
+                                reasoning_payload = maybe_send_reasoning()
+                                if reasoning_payload:
+                                    yield reasoning_payload
+
+                                initial_message = f"\n\n🔧 **Calling tool: `{escape_markdown(tool_name, for_code=True)}`**\n⏳ Executing...\n"
+                                info["displayed"] = True  # Mark as displayed so we don't show it again
+                                logger.info(f"Showing tool call in progress: {tool_name}")
+
+                                initial_chunk = {
+                                    "id": response_id or "chatcmpl-proxy",
+                                    "object": "chat.completion.chunk",
+                                    "created": 0,
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": initial_message},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(initial_chunk)}\n\n"
+
                     if current_event == "response.function_call_arguments.delta":
                         item_id = chunk_data.get("item_id")
                         delta = chunk_data.get("delta", "")
@@ -760,6 +837,34 @@ def stream_lm_studio_response(lm_studio_request):
 
     except requests.exceptions.ChunkedEncodingError as e:
         logger.error(f"Stream interrupted (likely MCP tool execution): {e}")
+
+        # If MCP tools were used, retry without them
+        if "tools" in lm_studio_request and not collected_content:
+            logger.warning("Retrying streaming request without MCP tools...")
+
+            # Send warning message
+            warning_chunk = {
+                "id": response_id or "chatcmpl-proxy",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": lm_studio_request.get("model"),
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "⚠️ **MCP tools disabled** (model/LM Studio compatibility issue)\n\n"},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(warning_chunk)}\n\n"
+
+            # Retry without MCP tools by recursively calling with modified request
+            lm_studio_request_no_mcp = lm_studio_request.copy()
+            del lm_studio_request_no_mcp["tools"]
+
+            # Stream the retry response
+            for chunk in stream_lm_studio_response(lm_studio_request_no_mcp):
+                yield chunk
+            return
+
         # Stream was interrupted - send what we have and finish gracefully
         if collected_content:
             logger.info(f"Collected {len(collected_content)} content chunks before interruption")
@@ -812,7 +917,7 @@ def stream_lm_studio_response(lm_studio_request):
         yield "data: [DONE]\n\n"
 
 
-def convert_lm_studio_to_openai(lm_response):
+def convert_lm_studio_to_openai(lm_response, mcp_disabled=False):
     """
     Convert LM Studio /v1/responses format to OpenAI chat completions format
     """
@@ -829,6 +934,10 @@ def convert_lm_studio_to_openai(lm_response):
                 if content_item.get('type') == 'output_text':
                     content = content_item.get('text', '')
                     break
+
+    # Add MCP disabled notice if tools were disabled due to error
+    if mcp_disabled and content:
+        content = "⚠️ **MCP tools disabled** (model/LM Studio compatibility issue)\n\n" + content
 
     # Build OpenAI-compatible response
     openai_response = {
